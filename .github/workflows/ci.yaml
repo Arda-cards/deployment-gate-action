@@ -1,0 +1,66 @@
+---
+name: ci
+on:
+  push:
+    branches:
+      - '**'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+permissions: { }
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: cat .github/super-linter.env >> "$GITHUB_ENV"
+      - uses: super-linter/super-linter@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  validate-release:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract tag from the changelog
+        uses: denisa/clq-action@v1
+        id: clq-extract
+        with:
+          changeMap: .github/clq/changemap.json
+          mode: release
+      - uses: denisa/semantic-tag-helper@v1
+        with:
+          mode: test
+          tag: ${{ steps.clq-extract.outputs.tag }}
+  tag:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ lint, validate-release ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denisa/clq-action@v1
+        id: clq-extract
+        with:
+          changeMap: .github/clq/changemap.json
+      - uses: denisa/semantic-tag-helper@v1
+        with:
+          mode: set
+          tag: ${{ steps.clq-extract.outputs.tag }}
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.clq-extract.outputs.tag }}
+          prerelease: ${{ steps.clq-extract.outputs.status == 'prereleased' }}
+          name: ${{ steps.clq-extract.outputs.name }}
+          body: ${{ steps.clq-extract.outputs.changes }}
