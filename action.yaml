@@ -1,9 +1,198 @@
 ---
-name: "..."
-description: "..."
+name: deployment-gate-action
+description: "Request or gant deployment"
 inputs:
-  ...
-outputs:
-  ...
+  aws_region:
+    description: "The AWS region to deploy to"
+    required: true
+  chart_name:
+    description: "The name of the chart to deploy"
+    required: true
+  chart_version:
+    description: "The version of the chart to deploy"
+    required: true
+  cluster_name:
+    description: "The name of the cluster"
+    required: true
+  deployment_gate:
+    description: "The operating mode for the gate, one of `none` or `manual`"
+    required: true
+  deployment_gate_namespace:
+    description: "The namespace for the various configuration maps"
+    required: false
+    default: "deployment-gate-action"
+  github_token:
+    description: "A github token that permits calling rerun-failed-jobs; required only to grant requests."
+    required: false
+  mode:
+    description: "`request` or `grant` permission to proceed"
+    required: true
+  purpose:
+    description: "The purpose in the deployment pipeline (dev, prod, ...)"
+    required: true
 runs:
-  ...
+  using: "composite"
+  steps:
+    - name: "${{ inputs.mode }} deployment gate"
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        [ "${RUNNER_DEBUG}" == 1 ] && set -xv
+        set -u
+
+        readonly config_map_name="${{ inputs.purpose }}-${{ inputs.chart_name }}"
+
+        function requestPermission() {
+          echo "::info Requesting permission to proceed for ${{ inputs.chart_version }}"
+
+          # Certainly not concurrency safe
+          # betting that we won't get many parallel attempts to deploy different versions of a component
+          kubectl apply --warnings-as-errors -f - <<HERE_REQUEST
+        ---
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: ${{ inputs.deployment_gate_namespace }}
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${config_map_name}
+          namespace: ${{ inputs.deployment_gate_namespace }}
+        data:
+          requests: |
+        $( \
+          jq \
+            --arg request_date "$(date -u -Iseconds)" \
+            --arg run_id "${{ github.run_id  }}" \
+            --arg version "${{ inputs.chart_version }}" \
+            '.version="1" | .granted[$version].request_date = $request_date | .granted[$version].run_id = $run_id' \
+            "${deployment_lock}" |
+          sed 's/^/    /' \
+        )
+        HERE_REQUEST
+          echo "Deployment requested"
+        }
+
+        function fetchRequestFile() {
+          if ! kubectl --namespace ${{ inputs.deployment_gate_namespace }} get configmap "${config_map_name}" --output jsonpath="{.data.requests}" >"${deployment_lock}"; then
+            case "${{ inputs.mode }}" in
+              grant)
+                echo "::error No deployment request pending" 
+              ;;
+              request)
+                echo "{}" >>"${deployment_lock}"
+                echo "::error ${{ inputs.deployment_gate_namespace }} not configured or first deployment for ${config_map_name}"
+                requestPermission
+              ;;
+            esac
+            exit 1
+          fi
+          
+          if ! jq -e '.' "${deployment_lock}" > /dev/null; then
+            echo "::error Unknown file format"
+            cat "${deployment_lock}"
+            exit 1
+          fi
+          
+          if jq -e '.version != "1"' "${deployment_lock}" > /dev/null; then
+            echo "::error Unknown file revision"
+            cat "${deployment_lock}"
+            exit 1
+          fi
+        }
+
+        function grantPermission() {
+          if jq -e \
+            --arg version "${{ inputs.chart_version }}" \
+            '.granted.[$version] == null' \
+            "${deployment_lock}" > /dev/null; \
+          then
+            echo "::error No request pending for version ${{ inputs.chart_version }}"
+            exit 1
+          fi
+
+          run_id="$(jq -r --arg version "${{ inputs.chart_version }}" '.granted[$version].run_id' "${deployment_lock}")"
+          if [ "${run_id}" == "null" ]; then
+            echo "::error Workflow run not defined for pending request for version ${{ inputs.chart_version }}"
+            exit 1
+          fi
+        
+          # Certainly not concurrency safe
+          # betting that we won't get many parallel attempts to deploy different versions of a component
+          kubectl apply --warnings-as-errors -f - <<HERE_GRANT
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${config_map_name}
+          namespace: ${{ inputs.deployment_gate_namespace }}
+        data:
+          requests: |
+        $( \
+          jq \
+            --arg version "${{ inputs.chart_version }}" \
+            --arg grant_date "$(date -u -Iseconds)" \
+            '.granted[$version].grant_date = $grant_date' \
+            "${deployment_lock}" |
+          sed 's/^/    /' \
+        )
+        HERE_GRANT
+
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${{ github.repository }}/actions/runs/${run_id}/rerun-failed-jobs"
+        }
+
+        function checkOrRequestPermission() {
+          if jq -e \
+            --arg version "${{ inputs.chart_version }}" \
+            '.granted.[$version] == null' \
+            "${deployment_lock}" > /dev/null; \
+          then
+            echo "::error Permission not yet requested for ${{ inputs.chart_version }}"
+            requestPermission
+            exit 1
+          fi
+          
+          if jq -e \
+              --arg version "${{ inputs.chart_version }}" \
+              --arg id "${{ github.run_id }}" \
+              '(.granted[$version].grant_date != null) and (.granted[$version].run_id == $id) | not' \
+              "${deployment_lock}" > /dev/null; \
+          then
+            echo "::error Permission not yet granted to ${{ inputs.chart_version }}, or granted to a different job"
+            requestPermission
+            exit 1
+          fi
+          
+          echo "Deployment request granted"
+        }
+        
+        if [ "${{ inputs.mode }}" == "request" ] && [ "${{ inputs.deployment_gate }}" == "none" ]; then
+          echo "Deployment request granted"
+          exit 0
+        fi
+        
+        aws eks --region "${{ inputs.aws_region }}" update-kubeconfig --name "${{ inputs.cluster_name }}"
+        cluster_iam=$(
+          aws eks describe-cluster --name "${{ inputs.cluster_name }}" |
+            jq -r '.cluster.arn | capture(":(?<id>[[:digit:]]+):").id'
+        )
+        
+        readonly deployment_lock="${RUNNER_TEMP}/requests.json"
+        rm -f "${deployment_lock}"
+        
+        fetchRequestFile 
+
+        case "${{ inputs.mode }}" in
+          grant)
+            grantPermission
+          ;;
+          request)
+            checkOrRequestPermission
+          ;;
+        esac
