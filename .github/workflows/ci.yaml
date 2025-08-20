@@ -2,36 +2,54 @@
 name: ci
 on:
   push:
-    branches:
-      - '**'
-    tags-ignore:
-      - '*'
   pull_request:
+    types: [ opened, ready_for_review, reopened, synchronize ]
 
 permissions: { }
 
 jobs:
   lint:
+    if: ${{ ! github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - run: cat .github/super-linter.env >> "$GITHUB_ENV"
-      - uses: super-linter/super-linter@v7
+      - uses: super-linter/super-linter@v8
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  is-target-branch-protected:
+    if: ${{ ! github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    outputs:
+      yes: ${{ steps.gh-query.outputs.validate_in_list }}
+    steps:
+      - name: "Check branch protection status"
+        id: gh-query
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "${RUNNER_DEBUG}" == 1 ] && set -xv
+          set -u
+
+          if gh ruleset check --repo "${GITHUB_REPOSITORY}" "${GITHUB_BASE_REF:-$GITHUB_REF_NAME}" \
+            | grep -q context:validate-release; \
+          then
+            echo "validate_in_list=true" >>"${GITHUB_OUTPUT}"
+          fi
   validate-release:
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: ${{ needs.is-target-branch-protected.outputs.yes }}
+    needs: is-target-branch-protected
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - name: Extract tag from the changelog
+      - uses: actions/checkout@v5
+      - name: "Extract tag from the changelog"
         uses: denisa/clq-action@v1
         id: clq-extract
         with:
@@ -42,14 +60,14 @@ jobs:
           mode: test
           tag: ${{ steps.clq-extract.outputs.tag }}
   tag:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     needs: [ lint, validate-release ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       deployments: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: denisa/clq-action@v1
         id: clq-extract
         with:
